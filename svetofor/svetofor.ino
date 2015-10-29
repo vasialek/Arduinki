@@ -1,11 +1,9 @@
-enum SvetoforStates { InitState = 0, GreenIsOn = 1, GreenIsEnding = 2, YellowIsOn = 3, RedIsOn = 6 };
+#define ADEBUG
 
-enum SvetoforModes { ManualMode = 0, AutomaticMode = 1 };
+enum SvetoforStates { InitState = 0, GreenIsOn = 1, GreenIsEnding = 2, YellowIsOn = 3, RedIsOn = 6, SleepIsOn, SleepIsOff };
 
-/* Modes:
- *  0: manual, on button press
- *  1: auto, after certain time
- */
+enum SvetoforModes { ManualMode = 0, AutomaticMode, AutomaticModeSlow, SleepMode };
+
 byte sfMode = 0;
 
 byte sfState = 0;
@@ -13,17 +11,26 @@ bool buttonWasPressed = false;
 
 // How many ticks (to switch states in automatic mode)
 int ticks = 0;
-int tickTimeMs = 200;
+int tickTimeMs = 100;
+//#ifdef ADEBUG
+//    int tickTimeMs = 400;
+//#else
+//    int tickTimeMs = 200;
+//#endif
 
 // To handle double click
 unsigned long lastButtonPressed = 0;
-unsigned long doubleClickTolleranceMs = 500;
+unsigned long doubleClickTolleranceMs = 700;
 
 // Svetofor light delays
-const byte greenTimeTicks = 20;
+const byte greenTimeTicks = 50;
 const byte greenFlashes = 5;    // How many times will turn on and off
-const byte yellowTimeTicks = 5;
-const byte redTimeTicks = 20;
+const byte yellowTimeTicks = 10;
+const byte redTimeTicks = 40;
+const byte sleepTimeTicks = 50; // LEDs are turned off in sleep mode
+
+// If mode is AutomaticModeSlow it will shift delay (<<)
+byte delayMultiplier = 0;
 
 //const byte greenTimeTicks = 3;
 //const byte greenFlashes = 1;    // How many times will turn on and off
@@ -31,20 +38,40 @@ const byte redTimeTicks = 20;
 //const byte redTimeTicks = 3;
 
 
-const int greenLightPin = 0;
-const int yellowLightPin = 1;
-const int redLightPin = 2;
-const int buttonPin = 4;
+#ifdef __AVR_ATtiny85__
+    const int greenLightPin = 0;
+    const int yellowLightPin = 1;
+    const int redLightPin = 2;
+    const int buttonPin = 4;
+    const int modeButtonPin = 5;
+#else
+    const int greenLightPin = 10;
+    const int yellowLightPin = 11;
+    const int redLightPin = 12;
+    const int buttonPin = 6;
+    const int modeButtonPin = 7;
+#endif
+
 
 int oldButtonState = LOW;
+int oldModeButtonState = LOW;
 
 void setup() {
-//    Serial.begin(9600);
+#ifdef ADEBUG
+    Serial.begin(9600);
+
+    Serial.print("Button PIN #");
+    Serial.println(buttonPin);
+    Serial.print("Mode button PIN #");
+    Serial.println(modeButtonPin);    
+#endif
+
     pinMode(greenLightPin, OUTPUT);
     pinMode(yellowLightPin, OUTPUT);
     pinMode(redLightPin, OUTPUT);
 
     pinMode(buttonPin, INPUT);
+    pinMode(modeButtonPin, INPUT);
 
     digitalWrite(redLightPin, HIGH);
     digitalWrite(yellowLightPin, HIGH);
@@ -59,16 +86,14 @@ void setup() {
 
 void loop() {
     if (wasButtonPressed()) {
-//        Serial.println("Button is pressed");
-//        Serial.print("  previous was pressed before: ");
-//        Serial.println(millis() - lastButtonPressed);
-        if (millis() - lastButtonPressed < doubleClickTolleranceMs) {
-//            Serial.println("Double clicked");
-            handleButtonClick(true);
-        } else {
-            handleButtonClick(false);
-        }
-        lastButtonPressed = millis();
+        log("Button is pressed");
+        handleButtonClick(false);
+    }
+
+    if (wasModeButtonPressed()) {
+        log("Mode switch button is pressed");
+        // Mode switch button emulates double click
+        handleButtonClick(true);
     }
 
 //    Serial.print("Svetofor state is: ");
@@ -78,6 +103,22 @@ void loop() {
 //    Serial.print(". Mode is: ");
 //    Serial.println(sfMode);
     switch (sfState) {
+        case (byte)SleepIsOn:
+            if (ticks % 2 == 1) {
+                digitalWrite(greenLightPin, HIGH);
+                digitalWrite(yellowLightPin, HIGH);
+                digitalWrite(redLightPin, HIGH);
+            } else {
+                digitalWrite(greenLightPin, LOW);
+                digitalWrite(yellowLightPin, LOW);
+                digitalWrite(redLightPin, LOW);
+            }
+            break;
+        case (byte)SleepIsOff:
+            if (ticks == 0) {
+                turnLightsOff();
+            }
+            break;
         case (byte)GreenIsOn:
             turnLedOnOrOff(greenLightPin, greenTimeTicks);
             break;
@@ -103,7 +144,11 @@ void loop() {
 
     switch (sfMode) {
         case (byte)AutomaticMode:
-            if (changeStateOnTicks(sfState) == false) {
+        case (byte)AutomaticModeSlow:
+            if (changeStateOnTicks(sfState) ) {
+                turnLightsOff();
+            } else
+            {
                 delay(tickTimeMs);
             }
             break;
@@ -112,6 +157,11 @@ void loop() {
                 changeStateOnTicks(sfState);
             }
             delay(tickTimeMs);
+            break;
+        case (byte)SleepMode:
+            if (changeStateOnTicks(sfState) == false) {
+                delay(tickTimeMs);
+            }
             break;
         default:
             delay(tickTimeMs);
@@ -127,7 +177,7 @@ bool changeStateOnTicks(byte currentState) {
     byte state = sfState;
     switch (currentState) {
         case (byte)GreenIsOn:
-              if (ticks == greenTimeTicks) {
+              if (ticks >= greenTimeTicks << delayMultiplier) {
 //                  Serial.println("Changing state to GreenIsEnding");
                   ticks = -1;
                   state = (byte)GreenIsEnding;
@@ -135,9 +185,9 @@ bool changeStateOnTicks(byte currentState) {
               break;
         case (byte)GreenIsEnding:
             // Green should goes LOW, HIGH,... LOW
-            if (ticks >= greenFlashes * 2) {
+            if (ticks >= (greenFlashes * 2) << delayMultiplier) {
                 ticks = -1;
-                if ((byte)AutomaticMode == sfMode) {
+                if ((byte)ManualMode != sfMode) {
 //                    Serial.println("Changing state to YellowIsOn");
                     state = (byte)YellowIsOn;
                 } else {
@@ -147,17 +197,29 @@ bool changeStateOnTicks(byte currentState) {
             }
             break;
         case (byte)YellowIsOn:
-            if (ticks == yellowTimeTicks) {
+            if (ticks >= yellowTimeTicks << delayMultiplier) {
                 ticks = -1;
 //                Serial.println("Changing state to RedIsOn");
                 state = (byte)RedIsOn;
             }
             break;
         case (byte)RedIsOn:
-            if (ticks == redTimeTicks) {
+            if (ticks >= redTimeTicks << delayMultiplier) {
                 ticks = -1;
 //                Serial.println("Changing state to GreenIsOn");
                 state = (byte)GreenIsOn;
+            }
+            break;
+        case (byte)SleepIsOn:
+            if (ticks > 3) {
+                ticks = -1;
+                state = (byte)SleepIsOff;
+            }
+            break;
+        case (byte)SleepIsOff:
+            if (ticks > sleepTimeTicks) {
+                ticks = -1;
+                state = (byte)SleepIsOn;
             }
             break;
         default:
@@ -177,7 +239,28 @@ void handleButtonClick(bool isDoubleClick) {
     if (isDoubleClick) {
         sfState = GreenIsOn;
         ticks = 0;
-        sfMode = (byte)ManualMode == sfMode ? (byte)AutomaticMode : (byte)ManualMode;
+        switch (sfMode) {
+            case (byte)ManualMode:
+                sfMode = (byte)AutomaticMode;
+                delayMultiplier = 0;
+                break;
+            case (byte)AutomaticMode:
+                sfMode = (byte)AutomaticModeSlow;
+                delayMultiplier = 1;
+                break;
+            case (byte)AutomaticModeSlow:
+                sfMode = (byte)SleepMode;
+                sfState = (byte)SleepIsOn;
+                delayMultiplier = 0;
+                break;
+            default:
+                sfMode = (byte)AutomaticMode;
+//                sfMode = (byte)ManualMode;
+                // Prevent long green flashing from AutomaticModeSlow
+                delayMultiplier = 0;
+                break;
+        }
+        turnLightsOff();
         return;
     }
     switch (sfMode) {
@@ -224,21 +307,33 @@ bool wasButtonPressed() {
     }
     oldButtonState = currentState;
     return wasPressed;
-    // Emulate button with Serial :)
-//    if (Serial.available() > 0) {
-//        Serial.read();
-//        return true;
-//    }
-//    return false;
+}
+
+bool wasModeButtonPressed() {
+    bool wasPressed = false;
+    const int currentState = digitalRead(modeButtonPin);
+    if (currentState != oldModeButtonState && currentState == HIGH) {
+        wasPressed = true;
+        delay(50);
+    }
+    oldModeButtonState = currentState;
+    return wasPressed;
 }
 
 void turnLedOnOrOff(int pin, byte lengthOfSignal) {
     // Need to turn on
     if (ticks == 0) {
         digitalWrite(pin, HIGH);
-    } else if (ticks >= lengthOfSignal) {
+        return;
+    }
+
+    if ((byte)AutomaticModeSlow == sfMode) {
+        lengthOfSignal = lengthOfSignal << delayMultiplier;
+    }
+    
+    if (ticks >= lengthOfSignal) {
         // Turn off on last tick
-        if ((byte)AutomaticMode == sfMode || sfState == YellowIsOn || sfState == GreenIsEnding) {
+        if ((byte)AutomaticMode == sfMode || (byte)AutomaticModeSlow == sfMode || sfState == YellowIsOn || sfState == GreenIsEnding) {
             digitalWrite(pin, LOW);
         }
     }
@@ -249,5 +344,11 @@ void turnLightsOff() {
     digitalWrite(greenLightPin, LOW);
     digitalWrite(yellowLightPin, LOW);
     digitalWrite(redLightPin, LOW);
+}
+
+void log(char *msg) {
+#ifdef ADEBUG
+    Serial.println(msg);
+#endif
 }
 
